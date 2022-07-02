@@ -1,18 +1,14 @@
 import 'dart:core';
+
 import 'package:farmr_client/blockchain.dart';
 import 'package:farmr_client/cache/cacheStruct.dart';
-import 'package:farmr_client/log/logitem.dart';
 import 'package:farmr_client/utils/sqlite.dart';
+import 'package:farmr_client/plot.dart';
+import 'package:farmr_client/hardware.dart';
+
 import 'package:universal_io/io.dart' as io;
 
 import 'package:logging/logging.dart';
-
-import 'package:farmr_client/plot.dart';
-import 'package:farmr_client/log/filter.dart';
-import 'package:farmr_client/log/signagepoint.dart';
-import 'package:farmr_client/log/shortsync.dart';
-
-import 'package:farmr_client/hardware.dart';
 
 import 'package:sqlite3/sqlite3.dart';
 
@@ -31,9 +27,15 @@ class Cache extends CacheStruct {
       return "";
   }
 
-  Cache(Blockchain blockchain, rootPath) : super(blockchain, rootPath) {
+  Cache(Blockchain blockchain, rootPath, bool firstInit)
+      : super(blockchain, rootPath) {
     cache = io.File(rootPath + "cache/cache${blockchain.fileExtension}.sqlite");
+    if (firstInit) {
+      _createTables();
+    }
+  }
 
+  void _createTables() {
     //opens database file or creates it if it doesnt exist
     final database = openSQLiteDB(cache.path, OpenMode.readWriteCreate);
 
@@ -48,43 +50,6 @@ class Cache extends CacheStruct {
       begin INTEGER NOT NULL,
       end INTEGER NOT NULL,
       date TEXT NOT NULL
-    );
-  ''',
-
-      //filters
-      '''
-    CREATE TABLE IF NOT EXISTS filters (
-      timestamp INTEGER NOT NULL PRIMARY KEY,
-      eligible INTEGER NOT NULL,
-      proofs INTEGER NOT NULL,
-      plotNumber INTEGER NOT NULL,
-      lookupTime INTEGER NOT NULL
-    );
-  ''',
-
-      // pool errors and harvester errors
-      '''
-    CREATE TABLE IF NOT EXISTS errors (
-      timestamp INTEGER NOT NULL PRIMARY KEY,
-      type TEXT NOT NULL
-    );
-  ''',
-
-      // signage points
-      '''
-    CREATE TABLE IF NOT EXISTS signagePoints (
-      timestamp INTEGER NOT NULL PRIMARY KEY,
-      spIndex INTEGER NOT NULL
-    );
-  ''',
-
-      // short sync events
-      '''
-    CREATE TABLE IF NOT EXISTS shortSyncs (
-      timestamp INTEGER NOT NULL PRIMARY KEY,
-      start INTEGER NOT NULL,
-      end INTEGER NOT NULL,
-      localTime TEXT NOT NULL
     );
   ''',
 
@@ -127,33 +92,11 @@ class Cache extends CacheStruct {
     saveSettings();
   }
 
-  void saveLogs(List<SignagePoint> newSPs, List<ShortSync> newSS,
-      List<Filter> newFilters, List<LogItem> newHEs, List<LogItem> newPEs) {
-    filters = newFilters;
-    signagePoints = newSPs;
-    shortSyncs = newSS;
-    harvesterErrors = newHEs;
-    poolErrors = newPEs;
-
-    //opens database file or creates it if it doesnt exist
-    final database = openSQLiteDB(cache.path, OpenMode.readWriteCreate);
-
-    _saveToDB(database, filters, "filters");
-    _saveToDB(database, signagePoints, "signagePoints");
-    _saveToDB(database, shortSyncs, "shortSyncs");
-    _saveToDB(database, harvesterErrors, "errors", "harvester");
-    _saveToDB(database, poolErrors, "errors", "pool");
-
-    database.dispose();
-  }
-
   void savePlots(List<Plot> newPlots) {
     plots = newPlots;
 
     //opens database file or creates it if it doesnt exist
     final database = openSQLiteDB(cache.path, OpenMode.readWriteCreate);
-
-    _saveToDB(database, plots, "plots");
 
     database.dispose();
   }
@@ -164,59 +107,12 @@ class Cache extends CacheStruct {
     //opens database file or creates it if it doesnt exist
     final database = openSQLiteDB(cache.path, OpenMode.readWriteCreate);
 
-    _saveToDB(database, memories, "memories");
-
     database.dispose();
-  }
-
-  static _saveToDB(Database database, List list, String table,
-      [String? errorType]) {
-    if (list.length > 0) {
-      //excludes winner entry from cache as that's dynamically set according to RPC info
-
-      final List<dynamic> keysMap = (table != "plots")
-          ? list.first.toJson().keys.toList()
-          : list.first
-              .toJsonPrivate()
-              .entries
-              .toList()
-              .where((e) => !(e.value is bool) && (e.key is String))
-              .toList()
-              .map((e) => e.key as String)
-              .toList();
-
-      final List<String> questionMarksMap = keysMap.map((e) => "?").toList();
-
-      final String query = (table == "errors")
-          ? "INSERT or IGNORE INTO $table (${keysMap.join(',')}, type) VALUES (${questionMarksMap.join(',')}, '$errorType')"
-          : "INSERT or IGNORE INTO $table (${keysMap.join(',')}) VALUES (${questionMarksMap.join(',')})";
-
-      final statement = database.prepare(query);
-
-      for (final object in list) {
-        final List<dynamic> values = (table != "plots")
-            ? object
-                .toJson()
-                .values
-                //converts bools to 0 (false) or 1 (true)
-                .map((e) => (e is bool) ? (e ? 1 : 0) : e)
-                .toList()
-            : object
-                .toJsonPrivate()
-                .values //converts bools to 0 (false) or 1 (true)
-                .where((e) => !(e is bool))
-                .toList();
-
-        statement.execute(values);
-      }
-
-      statement.dispose();
-    }
   }
 
   void saveSettings() {
     //opens database file or creates it if it doesnt exist
-    final database = openSQLiteDB(cache.path, OpenMode.readWriteCreate);
+    final database = openSQLiteDB(cache.path, OpenMode.readWrite);
 
     database.execute("""
         INSERT INTO settings (entry, value) VALUES ('binPath', ?) 
@@ -229,9 +125,8 @@ class Cache extends CacheStruct {
 
   void _load() {
     //opens database file or creates it if it doesnt exist
-    final database = openSQLiteDB(cache.path, OpenMode.readWriteCreate);
+    final database = openSQLiteDB(cache.path, OpenMode.readOnly);
 
-    //try {
     const String plotQuery = "SELECT * from plots";
     final plotResults = database.select(plotQuery);
 
@@ -248,41 +143,10 @@ class Cache extends CacheStruct {
     if (binPathOverride.existsSync())
       _binPath = binPathOverride.readAsStringSync().trim();
 
-    const String filterQuery = "SELECT * from filters WHERE timestamp > ?";
-    final filterResults = database.select(filterQuery, [parseUntil]);
-    for (var filterResult in filterResults)
-      filters.add(Filter.fromJson(filterResult, plots.length));
-
-    const String spQuery = "SELECT * from signagePoints WHERE timestamp > ?";
-    final spResults = database.select(spQuery, [parseUntil]);
-    for (final spResult in spResults)
-      signagePoints.add(SignagePoint.fromJson(spResult));
-
-    const String ssQuery = "SELECT * from shortSyncs WHERE timestamp > ?";
-    final ssResults = database.select(ssQuery, [parseUntil]);
-    for (final ssResult in ssResults)
-      shortSyncs.add(ShortSync.fromJson(ssResult));
-
-    const String peQuery =
-        "SELECT * from errors WHERE type = 'pool' AND timestamp > ?";
-    final peResults = database.select(peQuery, [parseUntil]);
-    for (final peResult in peResults)
-      poolErrors.add(LogItem.fromJson(peResult, LogItemType.Farmer));
-
-    const String heQuery =
-        "SELECT * from errors WHERE type = 'harvester' AND timestamp > ?";
-    final heResults = database.select(heQuery, [parseUntil]);
-    for (final heResult in heResults)
-      harvesterErrors.add(LogItem.fromJson(heResult, LogItemType.Farmer));
-
     const String memoryQuery = "SELECT * from memories WHERE timestamp > ?";
     final memoryResults = database.select(memoryQuery, [parseUntil]);
     for (final memoryResult in memoryResults)
       memories.add(Memory.fromJson(memoryResult));
-    // } catch (Exception) {
-    //  log.severe(
-    //       "ERROR: Failed to load ${cache.path}\nGenerating a new cache database.");
-    // }
 
     database.dispose();
   }

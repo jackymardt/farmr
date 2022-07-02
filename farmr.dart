@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
 import 'package:path/path.dart';
@@ -17,6 +16,10 @@ import 'package:farmr_client/config.dart';
 import 'package:farmr_client/blockchain.dart';
 import 'package:farmr_client/hpool/hpool.dart';
 import 'package:farmr_client/id.dart';
+import 'package:farmr_client/log/filter.dart';
+import 'package:farmr_client/log/signagepoint.dart';
+import 'package:farmr_client/log/shortsync.dart';
+import 'package:farmr_client/log/logitem.dart';
 
 import 'package:farmr_client/environment_config.dart';
 
@@ -30,7 +33,8 @@ import 'package:dart_console/dart_console.dart' as dartconsole;
 
 final log = Logger('Client');
 
-const Duration delay = Duration(minutes: 10); //10 minutes delay between updates
+Duration reportIntervalDuration =
+    Duration(minutes: 10); //10 minutes delay between updates
 
 // '/home/user/.farmr' for package installs, '.' (project path) for the rest
 String rootPath = "";
@@ -113,6 +117,9 @@ List<Blockchain> readBlockchains(ID id, String rootPath, List<String> args) {
         Blockchain blockchain = Blockchain(id, rootPath, args,
             jsonDecode(io.File(file.path).readAsStringSync()));
         blockchains.add(blockchain);
+
+        if (blockchain.binaryName == "chia")
+          reportIntervalDuration = blockchain.reportIntervalDuration;
       }
     }
   }
@@ -140,7 +147,7 @@ Map<String, String> outputs = {};
 
 main(List<String> args) async {
   clearLog();
-  initLogger(); //initializes logger
+  initLogger(); //initializes farmr logger
 
   //Kills command on ctrl c
   io.ProcessSignal.sigint.watch().listen((signal) {
@@ -169,7 +176,9 @@ main(List<String> args) async {
     //initializes ports and detects harvester/farmer mode
     await blockchain.initializePorts();
 
-    await blockchain.init();
+    //initializes blockchain class
+    await blockchain.init(true);
+
     outputs.putIfAbsent(
         "${blockchain.currencySymbol.toUpperCase()} - View report",
         () => "Generating ${blockchain.currencySymbol} report");
@@ -196,13 +205,7 @@ main(List<String> args) async {
 
   final mainIsolate = await Isolate.spawn(
     spawnBlokchains,
-    [
-      receivePort.sendPort,
-      blockchains,
-      onetime,
-      standalone,
-      args.contains("harvester")
-    ],
+    [receivePort.sendPort, blockchains, onetime, standalone],
   );
 
   receivePort.listen((message) {
@@ -266,10 +269,10 @@ Do not close this window or these stats will not show up in farmr.net and farmrB
   } catch (error) {}
 }
 
-void timeoutIsolate(SendPort timeoutPort) {
-  final int timeOutMins = delay.inMinutes * 2;
+Future<void> timeoutIsolate(SendPort timeoutPort) async {
+  final int timeOutMins = reportIntervalDuration.inMinutes * 2;
 
-  io.sleep(Duration(minutes: timeOutMins));
+  await Future.delayed(Duration(minutes: timeOutMins));
 
   timeoutPort.send("timeout");
 }
@@ -282,14 +285,69 @@ void spawnBlokchains(List<Object> arguments) async {
   List<Blockchain> blockchains = arguments[1] as List<Blockchain>;
   bool onetime = arguments[2] as bool;
   bool standalone = arguments[3] as bool;
-  bool argsContainsHarvester = arguments[4] as bool;
 
   initLogger(); //initializes logger
 
   int counter = 0;
 
-  final int delayBetweenInMilliseconds =
-      (delay.inMilliseconds / blockchains.length).round();
+  final int reportDelayBetweenInMilliseconds =
+      (reportIntervalDuration.inMilliseconds / blockchains.length).round();
+
+  //log parser isolate
+
+  //starts isolate for log parsing
+  final logParserReceivePort = ReceivePort();
+  final logParserIsolate = await Isolate.spawn(
+    startLogParsing,
+    [logParserReceivePort.sendPort, blockchains, onetime],
+  );
+
+  log.warning("Starting log parsers...");
+
+  logParserReceivePort.listen((message) {
+    if (message[0] is int) {
+      int key = message[0] as int;
+
+      if (message[1] is String) {
+        log.warning(message);
+
+        if (message[1].contains("stopped")) {
+          blockchains[key].completedFirstLogParse = true;
+
+          logParserReceivePort.close();
+          logParserIsolate.kill();
+        } else if (message[1].contains("not found")) {
+          blockchains[key].config.parseLogs = false;
+
+          logParserReceivePort.close();
+          logParserIsolate.kill();
+        }
+      } else if (message[1] is List<Object>) {
+        List<Object> logItems = message[1] as List<Object>;
+
+        blockchains[key].log.filters = logItems[0] as List<Filter>;
+        blockchains[key].log.signagePoints = logItems[1] as List<SignagePoint>;
+        blockchains[key].log.shortSyncs = logItems[2] as List<ShortSync>;
+        blockchains[key].log.poolErrors = logItems[3] as List<LogItem>;
+        blockchains[key].log.harvesterErrors = logItems[4] as List<LogItem>;
+
+        blockchains[key].log.genSubSlots();
+
+        if (!blockchains[key].completedFirstLogParse) {
+          blockchains[key].completedFirstLogParse = true;
+
+          log.warning(
+              "${blockchains[key].currencySymbol.toUpperCase()}: first log parse complete.");
+        }
+      }
+    }
+  });
+
+  //if log parsing is enabled then that implies blockchain must have completed first log parse
+  while (blockchains.any((blockchain) =>
+      !(!blockchain.config.parseLogs || blockchain.completedFirstLogParse))) {
+    await Future.delayed(Duration(milliseconds: 100));
+  }
 
   while (true) {
     clearLog(); //clears log
@@ -303,13 +361,13 @@ void spawnBlokchains(List<Object> arguments) async {
 
       //evenly distributes blockchains
       final int blockchainDelay =
-          (counter > 1) ? i * delayBetweenInMilliseconds : 0;
+          (counter > 1) ? i * reportDelayBetweenInMilliseconds : 0;
 
-      final receivePort = ReceivePort();
-      final isolate = await Isolate.spawn(
+      final reporterReceivePort = ReceivePort();
+      final reporterIsolate = await Isolate.spawn(
         handleBlockchainReport,
         [
-          receivePort.sendPort,
+          reporterReceivePort.sendPort,
           blockchain,
           blockchains.length,
           onetime,
@@ -319,12 +377,12 @@ void spawnBlokchains(List<Object> arguments) async {
       );
 
       void killMainIsolate() {
-        receivePort.close();
-        isolate.kill();
+        reporterReceivePort.close();
+        reporterIsolate.kill();
         if (standalone) io.exit(0);
       }
 
-      receivePort.listen((message) {
+      reporterReceivePort.listen((message) {
         sendPort.send({
           "${blockchain.currencySymbol.toUpperCase()} - View report":
               (message as List<String>)[0],
@@ -356,9 +414,26 @@ These addresses are NOT reported to farmr.net or farmrBot
       });
     }
 
-    await Future.delayed(delay);
+    await Future.delayed(reportIntervalDuration);
     if (onetime) io.exit(0);
   }
+}
+
+void startLogParsing(List<Object> arguments) async {
+  SendPort sendPort = arguments[0] as SendPort;
+  List<Blockchain> blockchains = arguments[1] as List<Blockchain>;
+  bool onetime = arguments[2] as bool;
+
+  List<Future<void>> blockchainFutures = blockchains
+      .map((blockchain) => blockchain.log.initLogParsing(
+          blockchain.config.parseLogs,
+          onetime,
+          blockchain.currencySymbol,
+          blockchains.indexOf(blockchain),
+          sendPort))
+      .toList();
+
+  await Future.wait(blockchainFutures);
 }
 
 //blockchain isolate
@@ -371,7 +446,10 @@ void handleBlockchainReport(List<Object> arguments) async {
   int blockchainDelay = arguments[5] as int;
 
   //kills isolate after 20 minutes
-  Future.delayed(Duration(minutes: (!onetime) ? (delay.inMinutes * 2) : 1), () {
+  Future.delayed(
+      Duration(
+          minutes: (!onetime) ? (reportIntervalDuration.inMinutes * 2) : 1),
+      () {
     sendPort.send([
       "${blockchain.currencySymbol} report killed. Are ${blockchain.binaryName} services running?",
       "",
@@ -406,9 +484,10 @@ void handleBlockchainReport(List<Object> arguments) async {
 
   //PARSES DATA
   // try {
-  //loads and updates cache every 10 minutes
+  //loads cache every 10 minutes
   //loads config every 10 minutes
-  await blockchain.init();
+  await blockchain.init(false);
+  //starts parsing logs every x seconds
 
   var client;
 
@@ -605,7 +684,7 @@ Future<void> sendReport(
         : "for id " + id + blockchain.fileExtension;
     String timestamp = DateFormat.Hms().format(DateTime.now());
     previousOutput +=
-        "\n$timestamp - Sent ${blockchain.binaryName} $type report to server $idText\nResending it in ${delay.inMinutes} minutes";
+        "\n$timestamp - Sent ${blockchain.binaryName} $type report to server $idText\nResending it in ${reportIntervalDuration.inMinutes} minutes";
 
     checkIfLinked(
         contents,

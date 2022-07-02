@@ -94,6 +94,17 @@ class Blockchain {
   late final ClientType type;
   String get typeName => type.toString().split('.')[1];
 
+  int _reportInterval = 600;
+  int get reportInterval => reportInterval;
+  Duration get reportIntervalDuration => Duration(seconds: _reportInterval);
+
+  int _logParseInterval = 60;
+  int get logParseInterval => reportInterval;
+  Duration get logParsingIntervalDuration =>
+      Duration(seconds: _logParseInterval);
+
+  bool completedFirstLogParse = false;
+
   Blockchain(this.id, this._rootPath, this._args, [dynamic json]) {
     _fromJson(json); //loads properties from serialized blokchain
 
@@ -137,7 +148,13 @@ class Blockchain {
       _onlineConfig = json['Online Config'] ?? true;
       _majorToMinorMultiplier = json['Major to Minor Multiplier'] ?? 1e12;
       _checkPlotSize = json['Check for Complete Plots'] ?? true;
+      _reportInterval = json['Report Interval'] ?? 600;
+      _logParseInterval = json['Log Parse Interval'] ?? 60;
     }
+
+    //sets limits of report interval
+    if (_reportInterval < 60) _reportInterval = 60;
+    if (_reportInterval > 1800) _reportInterval = 1800;
 
     //initializes default rpc ports for xch
     if (currencySymbol == "xch") {
@@ -215,9 +232,9 @@ class Blockchain {
     //io.stdin.readByteSync(); //DEBUGGING, comment
   }
 
-  Future<void> init() async {
+  Future<void> init(bool firstInit) async {
     // Setup
-    this.cache = new Cache(this, _rootPath);
+    this.cache = new Cache(this, _rootPath, firstInit);
 
     /** Initializes config, either creates a new one or loads a config file */
     this.config = new Config(this, this.cache, _rootPath, type);
@@ -228,14 +245,17 @@ class Blockchain {
     await this.config.init(this.onlineConfig,
         this._args.contains("headless") || this._args.contains("hpool"));
 
-    //TODO: find a way to not have to run this logUpdate command twice (in blockchain.init and every 10 minutes)
-    logUpdate();
-  }
-
-  //reparses log and adds new filters/shortsyncs/signagepoints
-  void logUpdate() {
-    this.log = new Log(this.logPath, this.cache, this.config.parseLogs,
-        this.binaryName, this.config.type, configPath);
+    if (firstInit) {
+      this.log = new Log(
+          this.logPath,
+          this.config.parseLogs,
+          this.binaryName,
+          this.config.type,
+          configPath,
+          this.cache.binPath,
+          firstInit,
+          this.logParsingIntervalDuration);
+    }
   }
 
   /** Returns configPath & logPath for the coin based on platform */
@@ -251,7 +271,6 @@ class Blockchain {
       //test mode for github releases
       OS.GitHub: ".github/workflows",
     };
-    // TODO: Potentially leverage String os = io.Platform.operatingSystem;
 
     return configPathMap[_os]!;
   }

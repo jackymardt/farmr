@@ -98,7 +98,8 @@ class Farmer extends Harvester with FarmerStatusMixin {
       {required Blockchain blockchain,
       String version = '',
       required this.type,
-      required this.rootPath})
+      required this.rootPath,
+      bool firstInit = false})
       : super(blockchain, version) {
     if (type != ClientType.HPool) {
       getNodeHeight(); //sets _syncedBlockHeight
@@ -110,8 +111,8 @@ class Farmer extends Harvester with FarmerStatusMixin {
 
       shortSyncs = blockchain.log.shortSyncs; //loads short sync events
 
-      _poolErrors = blockchain.cache.poolErrors.length;
-      _harvesterErrors = blockchain.cache.harvesterErrors.length;
+      _poolErrors = blockchain.log.poolErrors.length;
+      _harvesterErrors = blockchain.log.harvesterErrors.length;
     }
   }
 
@@ -273,14 +274,8 @@ class Farmer extends Harvester with FarmerStatusMixin {
       _getLegacyLocalWallets();
 
     for (String address in blockchain.config.coldWalletAddresses) {
-      //TODO: FIX THIS PART, it is throwing notifications when farmerStatus changes and switches from alltheblocks to localcoldwallet
-      //if full node is synced then uses local cold wallet
-      // if (farmerStatus == FarmerStatus.Farming)
       wallets.add(LocalColdWallet(
           blockchain: blockchain, address: address, rootPath: rootPath));
-      // else //else uses alltheblocks api
-      // wallets
-      //  .add(AllTheBlocksWallet(blockchain: blockchain, address: address));
     }
 
     await _verifyRewardAddresses();
